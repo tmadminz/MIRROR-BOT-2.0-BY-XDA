@@ -54,3 +54,5 @@ class TelegramDownloadStatus:
 
     def download(self):
         return self.__obj
+
+    
