@@ -33,3 +33,5 @@ class ExtractStatus:
 
     def processed_bytes(self):
         return 0
+
+    
