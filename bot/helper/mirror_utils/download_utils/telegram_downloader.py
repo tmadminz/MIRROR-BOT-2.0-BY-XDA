@@ -1,120 +1,193 @@
-import logging
 import random
+import string
+import logging
 
+from yt_dlp import YoutubeDL, DownloadError
+from threading import RLock
 from time import time
-from threading import RLock, Lock, Thread
+from re import search
 
-from bot import LOGGER, download_dict, download_dict_lock, app, STOP_DUPLICATE
-from ..status_utils.telegram_download_status import TelegramDownloadStatus
-from bot.helper.telegram_helper.message_utils import sendMarkup, sendStatusMessage
-from bot.helper.mirror_utils.upload_utils.gdriveTools import GoogleDriveHelper
+from bot import download_dict_lock, download_dict
+from bot.helper.telegram_helper.message_utils import sendStatusMessage
+from ..status_utils.youtube_dl_download_status import YoutubeDLDownloadStatus
 
-global_lock = Lock()
-GLOBAL_GID = set()
-logging.getLogger("pyrogram").setLevel(logging.WARNING)
+LOGGER = logging.getLogger(__name__)
 
 
-class TelegramDownloadHelper:
+class MyLogger:
+    def __init__(self, obj):
+        self.obj = obj
+
+    def debug(self, msg):
+        # Hack to fix changing extension
+        match = search(r'.Merger..Merging formats into..(.*?).$', msg) # To mkv
+        if not match and not self.obj.is_playlist:
+            match = search(r'.ExtractAudio..Destination..(.*?)$', msg) # To mp3
+        if match and not self.obj.is_playlist:
+            newname = match.group(1)
+            newname = newname.split("/")[-1]
+            self.obj.name = newname
+
+    @staticmethod
+    def warning(msg):
+        LOGGER.warning(msg)
+
+    @staticmethod
+    def error(msg):
+        if msg != "ERROR: Cancelling...":
+            LOGGER.error(msg)
+
+
+class YoutubeDLHelper:
     def __init__(self, listener):
         self.name = ""
+        self.is_playlist = False
         self.size = 0
         self.progress = 0
         self.downloaded_bytes = 0
+        self._last_downloaded = 0
+        self.__download_speed = 0
         self.__start_time = time()
         self.__listener = listener
-        self.__id = ""
+        self.__gid = ""
         self.__is_cancelled = False
+        self.__downloading = False
         self.__resource_lock = RLock()
+        self.opts = {'progress_hooks': [self.__onDownloadProgress],
+                     'logger': MyLogger(self),
+                     'usenetrc': True,
+                     'embedsubtitles': True,
+                     'prefer_ffmpeg': True,
+                     'cookiefile': 'cookies.txt'}
 
     @property
     def download_speed(self):
         with self.__resource_lock:
-            return self.downloaded_bytes / (time() - self.__start_time)
+            return self.__download_speed
 
-    def __onDownloadStart(self, name, size, file_id):
-        with global_lock:
-            GLOBAL_GID.add(file_id)
-        with self.__resource_lock:
-            self.name = name
-            self.size = size
-            self.__id = file_id
-        gid = ''.join(random.choices(file_id, k=12))
+    def __onDownloadProgress(self, d):
+        self.__downloading = True
+        if self.__is_cancelled:
+            raise ValueError("Cancelling...")
+        if d['status'] == "finished":
+            if self.is_playlist:
+                self._last_downloaded = 0
+        elif d['status'] == "downloading":
+            with self.__resource_lock:
+                self.__download_speed = d['speed']
+                if self.is_playlist:
+                    downloadedBytes = d['downloaded_bytes']
+                    chunk_size = downloadedBytes - self._last_downloaded
+                    self._last_downloaded = downloadedBytes
+                    self.downloaded_bytes += chunk_size
+                else:
+                    try:
+                        if d.get('total_bytes'):
+                            self.size = d['total_bytes']
+                        else:
+                            raise KeyError
+                    except KeyError:
+                        if d.get('total_bytes_estimate'):
+                            self.size = d['total_bytes_estimate']
+                    self.downloaded_bytes = d['downloaded_bytes']
+                try:
+                    self.progress = (self.downloaded_bytes / self.size) * 100
+                except ZeroDivisionError:
+                    pass
+
+    def __onDownloadStart(self):
         with download_dict_lock:
-            download_dict[self.__listener.uid] = TelegramDownloadStatus(self, self.__listener, gid)
+            download_dict[self.__listener.uid] = YoutubeDLDownloadStatus(self, self.__listener, self.__gid)
         sendStatusMessage(self.__listener.update, self.__listener.bot)
 
-    def __onDownloadProgress(self, current, total):
-        if self.__is_cancelled:
-            self.__onDownloadError('Cancelled by user!')
-            app.stop_transmission()
-            return
-        with self.__resource_lock:
-            self.downloaded_bytes = current
-            try:
-                self.progress = current / self.size * 100
-            except ZeroDivisionError:
-                pass
-
-    def __onDownloadError(self, error):
-        with global_lock:
-            try:
-                GLOBAL_GID.remove(self.__id)
-            except KeyError:
-                pass
-        self.__listener.onDownloadError(error)
-
     def __onDownloadComplete(self):
-        with global_lock:
-            GLOBAL_GID.remove(self.__id)
         self.__listener.onDownloadComplete()
 
-    def __download(self, message, path):
-        try:
-            download = app.download_media(message,
-                                                progress = self.__onDownloadProgress,
-                                                file_name = path
-                                               )
-        except Exception as e:
-            LOGGER.error(str(e))
-            return self.__onDownloadError(str(e))
-        if download is not None:
-            self.__onDownloadComplete()
-        elif not self.__is_cancelled:
-            self.__onDownloadError('Internal error occurred')
+    def __onDownloadError(self, error):
+        self.__listener.onDownloadError(error)
 
-    def add_download(self, message, path, filename):
-        _message = app.get_messages(message.chat.id, reply_to_message_ids=message.message_id)
-        media = None
-        media_array = [_message.document, _message.video, _message.audio]
-        for i in media_array:
-            if i is not None:
-                media = i
-                break
-        if media is not None:
-            with global_lock:
-                # For avoiding locking the thread lock for long time unnecessarily
-                download = media.file_id not in GLOBAL_GID
-            if filename == "":
-                name = media.file_name
-            else:
-                name = filename
-                path = path + name
+    def extractMetaData(self, link, name, get_info=False):
 
-            if download:
-                if STOP_DUPLICATE and not self.__listener.isLeech:
-                    LOGGER.info('Checking File/Folder if already in Drive...')
-                    smsg, button = GoogleDriveHelper().drive_list(name, True, True)
-                    if smsg:
-                        msg = "File/Folder is already available in Drive.\nHere are the search results:"
-                        return sendMarkup(msg, self.__listener.bot, self.__listener.update, button)
-                self.__onDownloadStart(name, media.file_size, media.file_id)
-                LOGGER.info(f'Downloading Telegram file with id: {media.file_id}')
-                Thread(target=self.__download, args=(_message, path)).start()
+        if get_info:
+            self.opts['playlist_items'] = '0'
+        with YoutubeDL(self.opts) as ydl:
+            try:
+                result = ydl.extract_info(link, download=False)
+                if get_info:
+                    return result
+                realName = ydl.prepare_filename(result)
+            except Exception as e:
+                if get_info:
+                    raise e
+                self.__onDownloadError(str(e))
+                return
+
+        if 'entries' in result:
+            for v in result['entries']:
+                try:
+                    self.size += v['filesize_approx']
+                except:
+                    pass
+            self.is_playlist = True
+            if name == "":
+                self.name = str(realName).split(f" [{result['id'].replace('*', '_')}]")[0]
             else:
-                self.__onDownloadError('File already being downloaded!')
+                self.name = name
         else:
-            self.__onDownloadError('No document in the replied message')
+            ext = realName.split('.')[-1]
+            if name == "":
+                newname = str(realName).split(f" [{result['id'].replace('*', '_')}]")
+                if len(newname) > 1:
+                    self.name = newname[0] + '.' + ext
+                else:
+                    self.name = newname[0]
+            else:
+                self.name = f"{name}.{ext}"
+
+    def __download(self, link):
+        try:
+            with YoutubeDL(self.opts) as ydl:
+                try:
+                    ydl.download([link])
+                except DownloadError as e:
+                    if not self.__is_cancelled:
+                        self.__onDownloadError(str(e))
+                    return
+            if self.__is_cancelled:
+                raise ValueError
+            self.__onDownloadComplete()
+        except ValueError:
+            self.__onDownloadError("Download Stopped by User!")
+
+    def add_download(self, link, path, name, qual, playlist):
+        if playlist:
+            self.opts['ignoreerrors'] = True
+        if "hotstar" in link or "sonyliv" in link:
+            self.opts['geo_bypass_country'] = 'IN'
+        self.__gid = ''.join(random.SystemRandom().choices(string.ascii_letters + string.digits, k=10))
+        self.__onDownloadStart()
+        if qual.startswith('ba/b'):
+            audio_info = qual.split('-')
+            qual = audio_info[0]
+            if len(audio_info) == 2:
+                rate = audio_info[1]
+            else:
+                rate = 320
+            self.opts['postprocessors'] = [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': f'{rate}'}]
+        self.opts['format'] = qual
+        LOGGER.info(f"Downloading with YT-DLP: {link}")
+        self.extractMetaData(link, name)
+        if self.__is_cancelled:
+            return
+        if not self.is_playlist:
+            self.opts['outtmpl'] = f"{path}/{self.name}"
+        else:
+            self.opts['outtmpl'] = f"{path}/{self.name}/%(title)s.%(ext)s"
+        self.__download(link)
 
     def cancel_download(self):
-        LOGGER.info(f'Cancelling download on user request: {self.__id}')
         self.__is_cancelled = True
+        LOGGER.info(f"Cancelling Download: {self.name}")
+        if not self.__downloading:
+            self.__onDownloadError("Download Cancelled by User!")
+
