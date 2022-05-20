@@ -30,3 +30,5 @@ class SplitStatus:
 
     def processed_bytes(self):
         return 0
+
+    
